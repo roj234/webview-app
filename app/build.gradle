@@ -1,0 +1,29 @@
+plugins {
+    id 'com.android.application'
+}
+android {
+    // 源码包名固定为 com.example，避免动态 applicationId 改变 R 的包名导致源码找不到 R。
+    namespace 'com.example'
+    compileSdk 34
+    defaultConfig {
+        applicationId "{{APP_PACKAGE}}"
+        minSdk 31
+        targetSdk 34
+        versionCode {{VERSION_CODE}}
+        versionName "{{VERSION_NAME}}"
+    }
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+dependencies {
+    // 零外部依赖 — 纯 Android SDK
+}

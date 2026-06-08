@@ -1,0 +1,223 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_dir:
+        description: '本仓库内的配置目录，需包含 config.json，可选 logo.png'
+        required: false
+        default: 'example-input/config'
+      assets_dir:
+        description: '本仓库内的前端构建目录；留空则不注入 assets'
+        required: false
+        default: ''
+      wrapper_repository:
+        description: 'Android 壳仓库；手动触发默认当前仓库'
+        required: false
+        default: ''
+      wrapper_ref:
+        description: 'Android 壳仓库分支/tag/commit；留空使用默认分支'
+        required: false
+        default: ''
+
+  workflow_call:
+    inputs:
+      config_artifact:
+        description: '配置 artifact 名称；artifact 内应包含 config.json，可选 logo.png 等文件'
+        required: true
+        type: string
+      config_path:
+        description: 'config_artifact 解压后的配置子目录'
+        required: false
+        type: string
+        default: '.'
+      assets_artifact:
+        description: '前端构建产物 artifact 名称；通常上传 dist/ 目录'
+        required: true
+        type: string
+      assets_path:
+        description: 'assets_artifact 解压后要复制进 app/src/main/assets 的子目录'
+        required: false
+        type: string
+        default: '.'
+      wrapper_repository:
+        description: 'Android 壳项目仓库'
+        required: false
+        type: string
+        default: 'roj234/webview-app'
+      wrapper_ref:
+        description: 'Android 壳项目分支/tag/commit；留空使用默认分支'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      KEYSTORE_BASE64:
+        required: false
+      KEYSTORE_PASSWORD:
+        required: false
+      KEY_ALIAS:
+        required: false
+      KEY_PASSWORD:
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Android wrapper project
+        if: ${{ inputs.wrapper_ref == '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.wrapper_repository || github.repository }}
+
+      - name: Checkout Android wrapper project at ref
+        if: ${{ inputs.wrapper_ref != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.wrapper_repository || github.repository }}
+          ref: ${{ inputs.wrapper_ref }}
+
+      - name: Download frontend assets artifact
+        if: ${{ inputs.assets_artifact != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.assets_artifact }}
+          path: /tmp/frontend-assets
+
+      - name: Download config artifact
+        if: ${{ inputs.config_artifact != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.config_artifact }}
+          path: /tmp/android-config
+
+      - name: Inject external config and assets
+        if: ${{ inputs.assets_artifact != '' }}
+        run: |
+          set -euo pipefail
+
+          CONFIG_BASE="/tmp/android-config/${{ inputs.config_path }}"
+          if [ ! -f "$CONFIG_BASE/config.json" ]; then
+            CANDIDATE="$(find /tmp/android-config -mindepth 1 -maxdepth 3 -type f -name config.json | head -n 1 || true)"
+            if [ -z "$CANDIDATE" ]; then
+              echo "config.json not found in config artifact: ${{ inputs.config_artifact }}" >&2
+              find /tmp/android-config -maxdepth 3 -type f -print || true
+              exit 1
+            fi
+            CONFIG_BASE="$(dirname "$CANDIDATE")"
+          fi
+
+          echo "Using config directory: $CONFIG_BASE"
+          cp -a "$CONFIG_BASE"/. .
+
+          ASSETS_BASE="/tmp/frontend-assets/${{ inputs.assets_path }}"
+          if [ ! -d "$ASSETS_BASE" ]; then
+            echo "assets path not found: $ASSETS_BASE" >&2
+            find /tmp/frontend-assets -maxdepth 3 -type d -print || true
+            exit 1
+          fi
+
+          rm -rf app/src/main/assets
+          mkdir -p app/src/main/assets
+          cp -a "$ASSETS_BASE"/. app/src/main/assets/
+
+          if [ ! -f app/src/main/assets/index.html ]; then
+            echo "Warning: app/src/main/assets/index.html not found. Please check assets_path." >&2
+            find app/src/main/assets -maxdepth 2 -type f | head -n 50 || true
+          fi
+
+      - name: Prepare local inputs for manual build
+        if: ${{ inputs.assets_artifact == '' }}
+        run: |
+          set -euo pipefail
+
+          CONFIG_DIR="${{ inputs.config_dir || 'example-input/config' }}"
+          if [ ! -d "$CONFIG_DIR" ] || [ ! -f "$CONFIG_DIR/config.json" ]; then
+            echo "config_dir must contain config.json: $CONFIG_DIR" >&2
+            exit 1
+          fi
+          cp -a "$CONFIG_DIR"/. .
+
+          ASSETS_DIR="${{ inputs.assets_dir }}"
+          if [ -n "$ASSETS_DIR" ]; then
+            if [ ! -d "$ASSETS_DIR" ]; then
+              echo "assets_dir not found: $ASSETS_DIR" >&2
+              exit 1
+            fi
+            rm -rf app/src/main/assets
+            mkdir -p app/src/main/assets
+            cp -a "$ASSETS_DIR"/. app/src/main/assets/
+          else
+            echo "No assets_dir provided; app/src/main/assets will stay as-is."
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Apply config
+        run: |
+          pip install Pillow -q
+          python3 Scripts/apply_config.py
+
+      - name: Build APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK
+        run: |
+          KS_B64="${{ secrets.KEYSTORE_BASE64 }}"
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 --decode > /tmp/release.keystore
+            KS_PASS="${{ secrets.KEYSTORE_PASSWORD }}"
+            KEY_ALIAS="${{ secrets.KEY_ALIAS }}"
+            KEY_PASS="${{ secrets.KEY_PASSWORD }}"
+          else
+            cp debug.keystore /tmp/release.keystore
+            KS_PASS="android"
+            KEY_ALIAS="androiddebugkey"
+            KEY_PASS="android"
+          fi
+          BUILD_TOOLS=$(ls $ANDROID_HOME/build-tools/ | sort -V | tail -1)
+          mkdir -p /tmp/signed
+          APK=$(find app/build -type f -name '*.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "No APK found" >&2
+            exit 1
+          fi
+          echo "Found APK: $APK"
+          OUT="/tmp/signed/${APK_NAME}.apk"
+          $ANDROID_HOME/build-tools/$BUILD_TOOLS/zipalign -v -p 4 "$APK" /tmp/aligned.apk
+          $ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner sign \
+            --ks /tmp/release.keystore --ks-pass "pass:$KS_PASS" \
+            --ks-key-alias "$KEY_ALIAS" --key-pass "pass:$KEY_PASS" \
+            --out "$OUT" /tmp/aligned.apk
+          $ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner verify "$OUT"
+          echo "Signed: $OUT"
+          ls -la /tmp/signed/
+          echo "SIGNED_DIR=/tmp/signed" >> $GITHUB_ENV
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: ${{ env.SIGNED_DIR }}/*.apk
+          if-no-files-found: error
+          retention-days: 7

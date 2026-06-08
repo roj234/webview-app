@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 默认配置：不允许明文 HTTP，只信任系统证书和用户安装证书 -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- 只允许本地开发地址使用明文 HTTP -->
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- Android 模拟器访问宿主机 -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+
+        <!-- Genymotion 常用宿主机地址，可按需保留 -->
+        <domain includeSubdomains="false">10.0.3.2</domain>
+
+        <!-- localhost / loopback -->
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+
+        <!-- 如果你有固定的局域网服务器 IP，可以显式添加 -->
+        <!-- <domain>192.168.1.100</domain> -->
+        <!-- <domain>192.168.0.10</domain> -->
+    </domain-config>
+</network-security-config>
