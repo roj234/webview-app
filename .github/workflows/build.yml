@@ -59,11 +59,21 @@ on:
         required: false
       KEY_PASSWORD:
         required: false
+    outputs:
+      apk_artifact_name:
+        description: '上传的 APK artifact 名称'
+        value: ${{ jobs.build.outputs.apk_artifact_name }}
+      apk_file_name:
+        description: 'APK 文件名'
+        value: ${{ jobs.build.outputs.apk_file_name }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      apk_artifact_name: ${{ steps.apk_outputs.outputs.apk_artifact_name }}
+      apk_file_name: ${{ steps.apk_outputs.outputs.apk_file_name }}
 
     steps:
       - name: Checkout Android wrapper project
@@ -213,6 +223,17 @@ jobs:
           echo "Signed: $OUT"
           ls -la /tmp/signed/
           echo "SIGNED_DIR=/tmp/signed" >> $GITHUB_ENV
+
+      - name: Export APK outputs
+        id: apk_outputs
+        run: |
+          APK_FILE="$(find "${SIGNED_DIR}" -maxdepth 1 -type f -name '*.apk' | head -n 1)"
+          if [ -z "$APK_FILE" ]; then
+            echo "No signed APK found in ${SIGNED_DIR}" >&2
+            exit 1
+          fi
+          echo "apk_artifact_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_file_name=$(basename "$APK_FILE")" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
@@ -20,14 +21,18 @@ import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.webkit.CookieManager;
+import android.webkit.ServiceWorkerController;
+import android.webkit.ServiceWorkerClient;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebViewClient;
 import android.webkit.ValueCallback;
+import android.webkit.MimeTypeMap;
 import android.widget.FrameLayout;
 import android.widget.Toast;
 
@@ -47,9 +52,10 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class MainActivity extends Activity {
-    private static final String APP_URL = "file:///android_asset/index.html";
+    private static final String APP_URL = "https://appassets.androidplatform.net/assets/index.html";
     private static final int MANUAL_IMAGE_UPLOAD_REQUEST = 1001;
     private static final int WEB_FILE_CHOOSER_REQUEST = 1002;
+    private static final int AUDIO_PERMISSION_REQUEST = 1003;
 
     private static int blobServerPort;
 
@@ -57,6 +63,9 @@ public class MainActivity extends Activity {
     private TopProgressBar progressBar;
     private boolean isDarkMode;
     private LocalHttpServer localHttpServer;
+
+    /** 每次启动随机生成，全程不变，防止其它 APP 乱下载文件 */
+    private String sessionToken;
 
     // 边缘滑动返回
     private static final float EDGE_SWIPE_MIN_X = 80;
@@ -66,6 +75,7 @@ public class MainActivity extends Activity {
     private String pendingUploadCallbackId;
     private Uri pendingCameraImageUri;
     private ValueCallback<Uri[]> pendingFileChooserCallback;
+    private String pendingAudioPermissionCallbackId;
     private long backPressedTime = 0L;
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -78,7 +88,7 @@ public class MainActivity extends Activity {
         getWindow().setDecorFitsSystemWindows(false);
         WindowInsetsController insetsController = getWindow().getInsetsController();
         if (insetsController != null) {
-            insetsController.hide(WindowInsets.Type.systemBars());
+            insetsController.hide(WindowInsets.Type.navigationBars());
             insetsController.setSystemBarsBehavior(
                     WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
         }
@@ -93,9 +103,10 @@ public class MainActivity extends Activity {
         // IME 适配 — 键盘弹出时把 WebView 往上顶
         FrameLayout root = findViewById(R.id.rootLayout);
         root.setOnApplyWindowInsetsListener((v, insets) -> {
+            int statusBarTop = insets.getInsets(WindowInsets.Type.statusBars()).top;
             int imeBottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
-            root.setPadding(0, 0, 0, imeBottom);
-            return insets;
+            root.setPadding(0, statusBarTop, 0, imeBottom);
+            return WindowInsets.CONSUMED;
         });
 
         clearUploadCache();
@@ -117,11 +128,11 @@ public class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
-        settings.setAllowFileAccess(true);
-        settings.setAllowFileAccessFromFileURLs(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowFileAccessFromFileURLs(false);
 
         // 夜间模式：WebView 自动暗色渲染 + 告知网页
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             settings.setAlgorithmicDarkeningAllowed(true);
         }
 
@@ -131,7 +142,7 @@ public class MainActivity extends Activity {
 
         webView.addJavascriptInterface(new WebViewApi(), "WebViewApi");
 
-        webView.setWebViewClient(new WebViewClient() {
+        var wc = new WebViewClient() {
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 progressBar.setProgress(0);
@@ -147,15 +158,52 @@ public class MainActivity extends Activity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
-                if (!url.startsWith("file://")) {
-                    try {
-                        startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                    } catch (Exception ignored) {}
-                    return true;
+                // 内部虚拟域放行，外部 URL 跳系统浏览器
+                if (url.startsWith("https://appassets.androidplatform.net/")) {
+                    return false;
                 }
-                return false;
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                } catch (Exception ignored) {
+                }
+                return true;
             }
-        });
+
+            /** 拦截虚拟域 https://appassets.androidplatform.net，从 assets/ 目录读取并返回 */
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                Uri uri = request.getUrl();
+                if (!"appassets.androidplatform.net".equals(uri.getHost())) {
+                    return super.shouldInterceptRequest(view, request);
+                }
+                String path = uri.getPath();
+                if (path == null) return assetNotFound();
+                if (path.startsWith("/assets/")) {
+                    String assetPath = path.substring("/assets/".length());
+                    if (assetPath.isEmpty()) assetPath = "index.html";
+                    try {
+                        InputStream is = getAssets().open(assetPath);
+                        String mime = guessMimeType(assetPath);
+                        String charset = isTextMime(mime) ? "UTF-8" : null;
+                        return new WebResourceResponse(mime, charset, is);
+                    } catch (IOException e) {
+                        return assetNotFound();
+                    }
+                }
+                return assetNotFound();
+            }
+        };
+        webView.setWebViewClient(wc);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            ServiceWorkerController swController = ServiceWorkerController.getInstance();
+            swController.setServiceWorkerClient(new ServiceWorkerClient() {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
+                    return wc.shouldInterceptRequest(null, request);
+                }
+            });
+        }
 
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -201,10 +249,14 @@ public class MainActivity extends Activity {
                     DownloadManager downloadManager = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
                     if (downloadManager != null) {
                         downloadManager.enqueue(request);
+                        Toast.makeText(MainActivity.this, "开始下载 "+filename, Toast.LENGTH_SHORT).show();
+                        return;
                     }
                 } catch (Exception e) {
-                    Toast.makeText(MainActivity.this, "下载失败", Toast.LENGTH_SHORT).show();
+                    System.err.println("downloadFile error");
+                    e.printStackTrace();
                 }
+                Toast.makeText(MainActivity.this, "下载失败", Toast.LENGTH_SHORT).show();
             });
         }
 
@@ -216,7 +268,7 @@ public class MainActivity extends Activity {
                 }
                 pendingUploadCallbackId = callbackId;
                 try {
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M &&
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
                                 checkSelfPermission(Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                         requestPermissions(new String[]{Manifest.permission.CAMERA}, MANUAL_IMAGE_UPLOAD_REQUEST);
                         return;
@@ -231,13 +283,38 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void setUserAgent(String ua) {
-            runOnUiThread(() -> webView.getSettings().setUserAgentString(ua));
+        public void setUserAgent(String ua) {runOnUiThread(() -> webView.getSettings().setUserAgentString(ua));}
+
+        @JavascriptInterface
+        public int serverPort() {return blobServerPort;}
+
+        @JavascriptInterface
+        public String getToken() {return sessionToken;}
+
+        @JavascriptInterface
+        public boolean hasAudioPermission() {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true;
+            return checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
         }
 
         @JavascriptInterface
-        public int blobSavePort() {
-            return blobServerPort;
+        public void requestAudioPermission(String callbackId) {
+            runOnUiThread(() -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                    resolveAudioPermission(callbackId, true);
+                    return;
+                }
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    resolveAudioPermission(callbackId, true);
+                } else {
+                    pendingAudioPermissionCallbackId = callbackId;
+                    requestPermissions(
+                            new String[]{Manifest.permission.RECORD_AUDIO},
+                            AUDIO_PERMISSION_REQUEST);
+                }
+            });
         }
     }
 
@@ -278,6 +355,7 @@ public class MainActivity extends Activity {
             }
             startActivityForResult(intent, MANUAL_IMAGE_UPLOAD_REQUEST);
         } catch (Exception e) {
+            System.err.println("openCameraForUpload error");
             e.printStackTrace();
             String callbackId = pendingUploadCallbackId;
             pendingUploadCallbackId = null;
@@ -289,6 +367,7 @@ public class MainActivity extends Activity {
 
     private void startLocalHttpServer() {
         if (localHttpServer != null) return;
+        sessionToken = UUID.randomUUID().toString();
         localHttpServer = new LocalHttpServer();
         localHttpServer.start();
     }
@@ -333,7 +412,7 @@ public class MainActivity extends Activity {
         String registerUploadImage(Uri uri) {
             String id = UUID.randomUUID().toString();
             uploadImages.put(id, uri);
-            return "http://127.0.0.1:" + blobServerPort + "/upload/" + id;
+            return "http://127.0.0.1:"+blobServerPort+"/upload/"+id+"?tk="+sessionToken;
         }
 
         private static String readHeader(InputStream input, byte[] buffer) throws IOException {
@@ -532,6 +611,12 @@ public class MainActivity extends Activity {
                     return;
                 }
 
+                String reqToken = getQueryParam(path, "tk");
+                if (!sessionToken.equals(reqToken)) {
+                    sendResponse(rawOutput, 403, "Forbidden", "invalid token");
+                    return;
+                }
+
                 if ("GET".equalsIgnoreCase(method) && path.startsWith("/upload/")) {
                     String id = path.substring("/upload/".length());
                     int question = id.indexOf('?');
@@ -601,7 +686,7 @@ public class MainActivity extends Activity {
     }
 
     private Uri createDownloadUri(String filename) throws IOException {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             android.content.ContentValues values = new android.content.ContentValues();
             values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
             values.put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream");
@@ -628,7 +713,7 @@ public class MainActivity extends Activity {
     }
 
     private void finishDownloadUri(Uri uri) {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && !"file".equals(uri.getScheme())) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !"file".equals(uri.getScheme())) {
             android.content.ContentValues values = new android.content.ContentValues();
             values.put(MediaStore.Downloads.IS_PENDING, 0);
             getContentResolver().update(uri, values, null, null);
@@ -666,6 +751,12 @@ public class MainActivity extends Activity {
         } else {
             js = "window.__imageUploaded(\"" + callbackId + "\", \"" + url + "\");";
         }
+        webView.evaluateJavascript(js, null);
+    }
+
+    private void resolveAudioPermission(String callbackId, boolean granted) {
+        if (callbackId == null) return;
+        String js = "window.__audioPermissionResult(\"" + callbackId + "\", " + granted + ");";
         webView.evaluateJavascript(js, null);
     }
 
@@ -711,6 +802,19 @@ public class MainActivity extends Activity {
         int fgColor = isDarkMode ? 0xFFFFFFFF : 0xFF000000;
         webView.setBackgroundColor(bgColor);
         progressBar.setBarColor(fgColor);
+
+        // 状态栏背景色跟随
+        getWindow().setStatusBarColor(bgColor);
+        // 状态栏图标/文字颜色（亮底深字，暗底浅字）
+        View decor = getWindow().getDecorView();
+        int visibility = decor.getSystemUiVisibility();
+        if (isDarkMode) {
+            // 暗底白字 → 移除 LIGHT_STATUS_BAR 标志
+            decor.setSystemUiVisibility(visibility & ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        } else {
+            // 亮底黑字 → 添加 LIGHT_STATUS_BAR 标志
+            decor.setSystemUiVisibility(visibility | View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        }
     }
 
     @Override
@@ -824,5 +928,52 @@ public class MainActivity extends Activity {
                 resolveUploadImage(callbackId, null);
             }
         }
+        if (requestCode == AUDIO_PERMISSION_REQUEST) {
+            String callbackId = pendingAudioPermissionCallbackId;
+            pendingAudioPermissionCallbackId = null;
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            resolveAudioPermission(callbackId, granted);
+        }
+    }
+
+    /** 根据文件扩展名推断 MIME 类型 */
+    private static String guessMimeType(String path) {
+        String ext = MimeTypeMap.getFileExtensionFromUrl(path);
+        if (ext != null) {
+            String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+            if (mime != null) return mime;
+        }
+        // MimeTypeMap 不覆盖的常见类型
+        if (path.endsWith(".html") || path.endsWith(".htm")) return "text/html";
+        if (path.endsWith(".js") || path.endsWith(".mjs"))  return "application/javascript";
+        if (path.endsWith(".css"))   return "text/css";
+        if (path.endsWith(".json"))  return "application/json";
+        if (path.endsWith(".xml"))   return "application/xml";
+        if (path.endsWith(".svg"))   return "image/svg+xml";
+        if (path.endsWith(".png"))   return "image/png";
+        if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+        if (path.endsWith(".gif"))   return "image/gif";
+        if (path.endsWith(".webp"))  return "image/webp";
+        if (path.endsWith(".ico"))   return "image/x-icon";
+        if (path.endsWith(".woff2")) return "font/woff2";
+        if (path.endsWith(".woff"))  return "font/woff";
+        if (path.endsWith(".ttf"))   return "font/ttf";
+        if (path.endsWith(".otf"))   return "font/otf";
+        if (path.endsWith(".wasm"))  return "application/wasm";
+        return "application/octet-stream";
+    }
+
+    /** 是否需要以文本编码返回（charset=UTF-8） */
+    private static boolean isTextMime(String mime) {
+        return mime.startsWith("text/")
+            || "application/javascript".equals(mime)
+            || "application/json".equals(mime)
+            || "application/xml".equals(mime);
+    }
+
+    /** 统一 404 响应 */
+    private static WebResourceResponse assetNotFound() {
+        return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", null, null);
     }
 }
