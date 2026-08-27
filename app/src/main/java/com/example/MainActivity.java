@@ -42,10 +42,14 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -440,8 +444,8 @@ public class MainActivity extends Activity {
             String response =
                     "HTTP/1.1 204 No Content\r\n" +
                             "Access-Control-Allow-Origin: *\r\n" +
-                            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
-                            "Access-Control-Allow-Headers: Content-Type, Content-Length\r\n" +
+                            "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n" +
+                            "Access-Control-Allow-Headers: *\r\n" +
                             "Access-Control-Max-Age: 86400\r\n" +
                             "Content-Length: 0\r\n" +
                             "Connection: close\r\n" +
@@ -588,6 +592,7 @@ public class MainActivity extends Activity {
 
                 boolean chunked = false;
                 long contentLength = -1L;
+                Map<String, String> reqHeaders = new LinkedHashMap<>();
 
                 String line;
                 while ((line = readHeader(input, buffer)) != null && !line.isEmpty()) {
@@ -603,6 +608,11 @@ public class MainActivity extends Activity {
                         } catch (Exception ignored) {
                         }
                     }
+
+                    int colon = line.indexOf(':');
+                    if (colon > 0) {
+                        reqHeaders.put(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
+                    }
                 }
 
                 // 处理 CORS 预检请求
@@ -614,6 +624,11 @@ public class MainActivity extends Activity {
                 String reqToken = getQueryParam(path, "tk");
                 if (!sessionToken.equals(reqToken)) {
                     sendResponse(rawOutput, 403, "Forbidden", "invalid token");
+                    return;
+                }
+
+                if (path.startsWith("/proxy")) {
+                    handleProxy(method, path, reqHeaders, chunked, contentLength, input, rawOutput, buffer);
                     return;
                 }
 
@@ -681,6 +696,135 @@ public class MainActivity extends Activity {
                     sendResponse(output, 500, "Internal Server Error", e.toString());
                 } catch (Exception ignored) {
                 }
+            }
+        }
+
+        /**
+         * 代理转发：接收 WebView 的请求，转发到用户自定义 URL，把上游响应透传回 WebView。
+         * 响应自动附带 CORS 头，绕过浏览器同源策略。
+         */
+        private void handleProxy(String method, String path, Map<String, String> reqHeaders,
+                                 boolean chunked, long contentLength,
+                                 InputStream input, OutputStream rawOutput, byte[] buffer) throws IOException {
+            String targetUrl = getQueryParam(path, "url");
+            if (targetUrl == null || targetUrl.isEmpty()) {
+                sendResponse(rawOutput, 400, "Bad Request", "missing 'url' parameter");
+                return;
+            }
+            try {
+                targetUrl = URLDecoder.decode(targetUrl, "UTF-8");
+            } catch (Exception e) {
+                sendResponse(rawOutput, 400, "Bad Request", "invalid url encoding");
+                return;
+            }
+
+            HttpURLConnection conn = null;
+            boolean headersSent = false;
+            try {
+                URL url = new URL(targetUrl);
+                String scheme = url.getProtocol();
+                if (!"http".equals(scheme) && !"https".equals(scheme)) {
+                    sendResponse(rawOutput, 400, "Bad Request", "only http/https supported");
+                    return;
+                }
+
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod(method);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(600000);  // 10 分钟，防止无响应请求堆积
+                conn.setInstanceFollowRedirects(true);
+
+                // 转发请求头（跳过逐跳头和代理专有头）
+                for (Map.Entry<String, String> entry : reqHeaders.entrySet()) {
+                    String name = entry.getKey().toLowerCase(Locale.US);
+                    if (name.equals("host") || name.equals("content-length") ||
+                        name.equals("transfer-encoding") || name.equals("connection") ||
+                        name.equals("x-requested-with")) {
+                        continue;
+                    }
+                    conn.setRequestProperty(entry.getKey(), entry.getValue());
+                }
+
+                // 转发请求体
+                boolean hasBody = !method.equalsIgnoreCase("GET") && !method.equalsIgnoreCase("HEAD");
+                if (hasBody) {
+                    conn.setDoOutput(true);
+                    if (contentLength > 0) {
+                        conn.setFixedLengthStreamingMode(contentLength);
+                    } else {
+                        conn.setChunkedStreamingMode(8192);
+                    }
+                    try (OutputStream out = conn.getOutputStream()) {
+                        if (chunked) {
+                            copyChunked(input, out, buffer);
+                        } else if (contentLength > 0) {
+                            copyFixed(input, out, contentLength, buffer);
+                        } else if (contentLength != 0) {
+                            int read;
+                            while ((read = input.read(buffer)) != -1) {
+                                out.write(buffer, 0, read);
+                            }
+                        }
+                        out.flush();
+                    }
+                }
+
+                // 读取上游响应
+                int status = conn.getResponseCode();
+                String reason = conn.getResponseMessage();
+                if (reason == null) reason = "";
+
+                StringBuilder resp = new StringBuilder();
+                resp.append("HTTP/1.1 ").append(status).append(" ").append(reason).append("\r\n");
+                resp.append("Access-Control-Allow-Origin: *\r\n");
+                resp.append("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n");
+                resp.append("Access-Control-Allow-Headers: *\r\n");
+                resp.append("Access-Control-Expose-Headers: *\r\n");
+
+                // 透传上游响应头（跳过逐跳头和 CORS 头，避免重复）
+                Map<String, List<String>> respHeaders = conn.getHeaderFields();
+                if (respHeaders != null) {
+                    for (Map.Entry<String, List<String>> entry : respHeaders.entrySet()) {
+                        String name = entry.getKey();
+                        if (name == null) continue;
+                        String lower = name.toLowerCase(Locale.US);
+                        if (lower.startsWith("access-control-") ||
+                            lower.equals("transfer-encoding") ||
+                            lower.equals("connection")) {
+                            continue;
+                        }
+                        for (String value : entry.getValue()) {
+                            resp.append(name).append(": ").append(value).append("\r\n");
+                        }
+                    }
+                }
+                resp.append("Connection: close\r\n");
+                resp.append("\r\n");
+
+                rawOutput.write(resp.toString().getBytes(StandardCharsets.UTF_8));
+                rawOutput.flush();
+                headersSent = true;
+
+                // 流式转发响应体
+                InputStream respInput = status < 400 ? conn.getInputStream() : conn.getErrorStream();
+                if (respInput != null) {
+                    int read;
+                    while ((read = respInput.read(buffer)) != -1) {
+                        rawOutput.write(buffer, 0, read);
+                    }
+                }
+                rawOutput.flush();
+
+            } catch (Exception e) {
+                e.printStackTrace();
+                if (!headersSent) {
+                    try {
+                        sendResponse(rawOutput, 502, "Bad Gateway", e.toString());
+                    } catch (Exception ignored) {
+                    }
+                }
+            } finally {
+                if (conn != null) conn.disconnect();
             }
         }
     }
