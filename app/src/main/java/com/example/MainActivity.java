@@ -10,9 +10,10 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.MediaStore;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
@@ -38,7 +39,6 @@ import android.widget.Toast;
 
 import java.io.BufferedInputStream;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -82,6 +82,10 @@ public class MainActivity extends Activity {
     private String pendingAudioPermissionCallbackId;
     private long backPressedTime = 0L;
 
+    private int backQueryState = 0;
+    private final Handler backQueryHandler = new Handler(Looper.getMainLooper());
+    private static final long BACK_QUERY_TIMEOUT_MS = 250L;
+
     @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -114,9 +118,22 @@ public class MainActivity extends Activity {
         });
 
         clearUploadCache();
+        clearDownloadCache();
         startLocalHttpServer();
         setupWebView();
         setupEdgeSwipe();
+    }
+
+    private void clearDownloadCache() {
+        try {
+            int deleted = getContentResolver().delete(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    MediaStore.MediaColumns.IS_PENDING + "=1 AND "
+                            + MediaStore.MediaColumns.OWNER_PACKAGE_NAME + "=?",
+                    new String[]{ getPackageName() });
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -134,11 +151,6 @@ public class MainActivity extends Activity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         settings.setAllowFileAccess(false);
         settings.setAllowFileAccessFromFileURLs(false);
-
-        // 夜间模式：WebView 自动暗色渲染 + 告知网页
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            settings.setAlgorithmicDarkeningAllowed(true);
-        }
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(false);
@@ -199,15 +211,13 @@ public class MainActivity extends Activity {
         };
         webView.setWebViewClient(wc);
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            ServiceWorkerController swController = ServiceWorkerController.getInstance();
-            swController.setServiceWorkerClient(new ServiceWorkerClient() {
-                @Override
-                public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
-                    return wc.shouldInterceptRequest(null, request);
-                }
-            });
-        }
+        ServiceWorkerController swController = ServiceWorkerController.getInstance();
+        swController.setServiceWorkerClient(new ServiceWorkerClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
+                return wc.shouldInterceptRequest(null, request);
+            }
+        });
 
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -272,8 +282,7 @@ public class MainActivity extends Activity {
                 }
                 pendingUploadCallbackId = callbackId;
                 try {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-                                checkSelfPermission(Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    if (checkSelfPermission(Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                         requestPermissions(new String[]{Manifest.permission.CAMERA}, MANUAL_IMAGE_UPLOAD_REQUEST);
                         return;
                     }
@@ -297,26 +306,17 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public boolean hasAudioPermission() {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true;
-            return checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED;
         }
 
         @JavascriptInterface
         public void requestAudioPermission(String callbackId) {
             runOnUiThread(() -> {
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-                    resolveAudioPermission(callbackId, true);
-                    return;
-                }
-                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                        == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
                     resolveAudioPermission(callbackId, true);
                 } else {
                     pendingAudioPermissionCallbackId = callbackId;
-                    requestPermissions(
-                            new String[]{Manifest.permission.RECORD_AUDIO},
-                            AUDIO_PERMISSION_REQUEST);
+                    requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, AUDIO_PERMISSION_REQUEST);
                 }
             });
         }
@@ -623,7 +623,7 @@ public class MainActivity extends Activity {
 
                 String reqToken = getQueryParam(path, "tk");
                 if (!sessionToken.equals(reqToken)) {
-                    sendResponse(rawOutput, 403, "Forbidden", "invalid token");
+                    sendResponse(rawOutput, 403, "Forbidden", "");
                     return;
                 }
 
@@ -638,7 +638,7 @@ public class MainActivity extends Activity {
                     if (question >= 0) id = id.substring(0, question);
                     Uri uri = uploadImages.get(id);
                     if (uri == null) {
-                        sendResponse(rawOutput, 404, "Not Found", "upload image not found");
+                        sendResponse(rawOutput, 404, "Not Found", "");
                     } else {
                         sendUriResponse(rawOutput, uri);
                     }
@@ -646,12 +646,12 @@ public class MainActivity extends Activity {
                 }
 
                 if (!"POST".equalsIgnoreCase(method)) {
-                    sendResponse(rawOutput, 405, "Method Not Allowed", "Only GET /upload/{id} or POST /save allowed");
+                    sendResponse(rawOutput, 405, "Method Not Allowed", "");
                     return;
                 }
 
                 if (!path.startsWith("/save")) {
-                    sendResponse(rawOutput, 404, "Not Found", "not found");
+                    sendResponse(rawOutput, 404, "Not Found", "");
                     return;
                 }
 
@@ -660,15 +660,26 @@ public class MainActivity extends Activity {
                     filename = "download.bin";
                 }
 
-                filename = URLDecoder.decode(filename, "UTF-8");
+                filename = URLDecoder.decode(filename, StandardCharsets.UTF_8);
                 String safeName = sanitizeFilename(filename);
 
-                System.out.println("[Blob] save filename: " + safeName);
-                System.out.println("[Blob] chunked: " + chunked + ", contentLength: " + contentLength);
+                String idParam = getQueryParam(path, "id");
+                boolean isLast = "1".equals(getQueryParam(path, "last"));
 
-                Uri uri = createDownloadUri(safeName);
+                Uri uri;
+				if (idParam != null) uri = android.content.ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, Long.parseLong(idParam.trim()));
+				else {
+                    String mime = reqHeaders.get("content-type");
+                    if (mime != null) {
+                        mime = URLDecoder.decode(mime, StandardCharsets.UTF_8);
+                        int pos = mime.indexOf(';');
+                        if (pos > 0) mime = mime.substring(0, pos).trim();
+                    }
+                    if (mime == null || !mime.contains("/")) mime = guessMimeType(safeName);
+                    uri = createDownloadUri(safeName, mime);
+                }
 
-                try (OutputStream fileOutput = openDownloadOutput(uri)) {
+				try (OutputStream fileOutput = openDownloadOutput(uri, idParam != null)) {
                     if (chunked) {
                         copyChunked(input, fileOutput, buffer);
                     } else if (contentLength >= 0) {
@@ -683,11 +694,12 @@ public class MainActivity extends Activity {
                     fileOutput.flush();
                 }
 
-                finishDownloadUri(uri);
-                runOnUiThread(() -> Toast.makeText(MainActivity.this, "文件 " + safeName + " 已下载", Toast.LENGTH_SHORT).show());
+                if (isLast) {
+                    finishDownloadUri(uri);
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "文件 " + safeName + " 已下载", Toast.LENGTH_SHORT).show());
+                }
 
-                sendResponse(rawOutput, 201, "Created", "OK");
-
+                sendResponse(rawOutput, 201, "Created", String.valueOf(android.content.ContentUris.parseId(uri)));
             } catch (Exception e) {
                 e.printStackTrace();
 
@@ -829,39 +841,27 @@ public class MainActivity extends Activity {
         }
     }
 
-    private Uri createDownloadUri(String filename) throws IOException {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            android.content.ContentValues values = new android.content.ContentValues();
-            values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
-            values.put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream");
-            values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-            values.put(MediaStore.Downloads.IS_PENDING, 1);
-            Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-            if (uri == null) throw new IOException("Cannot create download item");
-            return uri;
-        }
-        File file = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), filename);
-        return Uri.fromFile(file);
+    private Uri createDownloadUri(String filename, String mimeType) throws IOException {
+        android.content.ContentValues values = new android.content.ContentValues();
+        values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
+        values.put(MediaStore.Downloads.MIME_TYPE, mimeType);
+        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+        values.put(MediaStore.Downloads.IS_PENDING, 1);
+        Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) throw new IOException("Cannot create download item");
+        return uri;
     }
 
-    private OutputStream openDownloadOutput(Uri uri) throws IOException {
-        if ("file".equals(uri.getScheme())) {
-            File file = new File(uri.getPath());
-            File parent = file.getParentFile();
-            if (parent != null && !parent.exists()) parent.mkdirs();
-            return new FileOutputStream(file);
-        }
-        OutputStream output = getContentResolver().openOutputStream(uri);
+    private OutputStream openDownloadOutput(Uri uri, boolean append) throws IOException {
+        OutputStream output = getContentResolver().openOutputStream(uri, append ? "wa" : "w");
         if (output == null) throw new IOException("Cannot open output");
         return output;
     }
 
     private void finishDownloadUri(Uri uri) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !"file".equals(uri.getScheme())) {
-            android.content.ContentValues values = new android.content.ContentValues();
-            values.put(MediaStore.Downloads.IS_PENDING, 0);
-            getContentResolver().update(uri, values, null, null);
-        }
+        android.content.ContentValues values = new android.content.ContentValues();
+        values.put(MediaStore.Downloads.IS_PENDING, 0);
+        getContentResolver().update(uri, values, null, null);
     }
 
     private long getUriLength(Uri uri) {
@@ -961,18 +961,46 @@ public class MainActivity extends Activity {
         }
     }
 
+    Runnable fallback = () -> {
+        backQueryState = 2;
+        handleNativeBack();
+    };
+
     @Override
     public void onBackPressed() {
+        if (backQueryState == 0) {
+            backQueryState = 1;
+            backQueryHandler.postDelayed(fallback, BACK_QUERY_TIMEOUT_MS);
+            try {
+                webView.evaluateJavascript("window.__onBack()", value -> {
+                    if (backQueryState != 1) return;
+                    backQueryState = 0;
+                    backQueryHandler.removeCallbacks(fallback);
+
+                    if (!"true".equals(value))
+                        handleNativeBack();
+                });
+                return;
+            } catch (Exception e) {
+                backQueryState = 2;
+                backQueryHandler.removeCallbacks(fallback);
+            }
+        }
+
+        handleNativeBack();
+    }
+
+    private void handleNativeBack() {
         if (webView.canGoBack()) {
             webView.goBack();
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - backPressedTime < 2000) {
+            super.onBackPressed();
         } else {
-            long now = System.currentTimeMillis();
-            if (now - backPressedTime < 2000) {
-                super.onBackPressed();
-            } else {
-                backPressedTime = now;
-                Toast.makeText(this, "再按一次退出", Toast.LENGTH_SHORT).show();
-            }
+            backPressedTime = now;
+            Toast.makeText(this, "再按一次退出", Toast.LENGTH_SHORT).show();
         }
     }
 
